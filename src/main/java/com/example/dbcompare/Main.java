@@ -20,7 +20,7 @@ public class Main extends Application {
     @Override
     public void start(Stage primaryStage) throws Exception {
         Connection oracleConn = DriverManager.getConnection(
-                "jdbc:oracle:thin:@37.120.189.200:1521:xe", "EKP_MONITOR", "ekp123");
+                "jdbc:oracle:thin:@37.120.189.200:1521:xe", "EKP_MONITOR", "xxxxxx");
 
         resolver = new DBConfigResolver(oracleConn);
         dbMap = resolver.resolveConnections();
