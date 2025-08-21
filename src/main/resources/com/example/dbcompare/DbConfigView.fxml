@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<?import javafx.scene.control.*?>
+<?import javafx.scene.layout.*?>
+<BorderPane xmlns="http://javafx.com/javafx/8" xmlns:fx="http://javafx.com/fxml/1"
+            fx:controller="com.example.dbcompare.DbConfigController">
+    <top>
+        <ToolBar>
+            <Button text="➕ Neu"   onAction="#onAddRow"/>
+            <Button text="🗑️ Löschen" onAction="#onDeleteSelected"/>
+            <Separator orientation="VERTICAL"/>
+            <Button text="💾 Speichern" onAction="#onSaveAll"/>
+            <Button text="🔄 Refresh" onAction="#onRefresh"/>
+            <Separator orientation="VERTICAL"/>
+            <CheckBox fx:id="showPasswords" text="Passwörter anzeigen" onAction="#onTogglePasswords"/>
+            <Region BorderPane.alignment="CENTER"/>
+        </ToolBar>
+    </top>
+    <center>
+        <TableView fx:id="table" editable="true">
+            <columns>
+                <TableColumn fx:id="colKuerzel" text="KÜRZEL" prefWidth="120"/>
+                <TableColumn fx:id="colUrl"     text="DB_URL" prefWidth="380"/>
+                <TableColumn fx:id="colUser"    text="USERNAME" prefWidth="180"/>
+                <TableColumn fx:id="colPass"    text="PASS" prefWidth="180"/>
+            </columns>
+        </TableView>
+    </center>
+    <bottom>
+        <Label style="-fx-padding: 6;"
+               text="Tipp: Doppelklick zum Bearbeiten. Mit 💾 speichern. Änderungen wirken sofort bei 'Refresh' im Hauptfenster."/>
+    </bottom>
+</BorderPane>

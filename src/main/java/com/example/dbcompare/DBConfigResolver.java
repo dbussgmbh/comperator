@@ -30,7 +30,7 @@ public class DBConfigResolver {
 
         Map<String, String> map = new LinkedHashMap<>();
 
-        final String sql = "SELECT KUERZEL, DB_URL, HOST, PORT, SID, USERNAME, PASS FROM DB_CONFIG";
+        final String sql = "SELECT KUERZEL, DB_URL, USERNAME, PASS FROM DB_CONFIG";
 
         try (PreparedStatement ps = oracleConnection.prepareStatement(sql);
              ResultSet rs = ps.executeQuery()) {
@@ -39,23 +39,10 @@ public class DBConfigResolver {
                 String kuerzel = trim(rs.getString("KUERZEL"));
                 String url     = trim(rs.getString("DB_URL"));
                 String user    = trim(rs.getString("USERNAME"));
-                String pass    = nvl(rs.getString("PASS"), "");
+                String encPass = rs.getString("PASS");
+                String pass    =CryptoUtil.decryptToString(encPass);
 
                 if (isBlank(kuerzel)) continue;
-
-                // 1) Primär: DB_URL direkt verwenden
-                if (isBlank(url)) {
-                    // 2) Fallback für Altbestände: aus HOST/PORT/SID bauen (Oracle thin)
-                    String host = trim(rs.getString("HOST"));
-                    String port = trim(rs.getString("PORT"));
-                    String sid  = trim(rs.getString("SID"));
-                    if (!isBlank(host) && !isBlank(port) && !isBlank(sid)) {
-                        url = "jdbc:oracle:thin:@//" + host + ":" + port + "/" + sid;
-                    } else {
-                        // Wenn weder DB_URL noch Fallback möglich → Eintrag überspringen
-                        continue;
-                    }
-                }
 
                 map.put(kuerzel, url + ";" + nvl(user, "") + ";" + nvl(pass, ""));
             }
