@@ -1,7 +1,10 @@
 package com.example.dbcompare;
 
 import javafx.application.Application;
+import javafx.application.Platform;
+import javafx.concurrent.Task;
 import javafx.geometry.Insets;
+import javafx.geometry.Pos;
 import javafx.scene.Scene;
 import javafx.scene.control.*;
 import javafx.scene.layout.*;
@@ -19,6 +22,12 @@ public class Main extends Application {
     private DBConfigResolver resolver;
     private Map<String, String> dbMap;
     private Connection oracleConn;
+
+    // UI-Elemente für Busy-Overlay
+    private ProgressIndicator busy;
+    private Label busyLabel;
+    private StackPane overlay;
+    private HBox topBar;
 
     @Override
     public void start(Stage primaryStage) throws Exception {
@@ -39,26 +48,49 @@ public class Main extends Application {
         resolver = new DBConfigResolver(oracleConn);
         dbMap = resolver.resolveConnections();
 
-        VBox root = new VBox();
+        // --- Layout ---
+        VBox content = new VBox();
 
         // Buttons
         Button refreshButton = new Button("🔄 Refresh");
-        refreshButton.setOnAction(e -> refreshTable());
+        refreshButton.setOnAction(e -> refreshTableAsync()); // <-- asynchron
 
         Button exportButton = new Button("📄 Als Excel exportieren");
         exportButton.setOnAction(e -> exportTableToExcel(tableView));
 
-        Button configButton = new Button("⚙️ DB-Config");
+        Button configButton = new Button("⚙ DB-Config");
         configButton.setOnAction(e -> openDbConfigWindow());
 
-        HBox topBar = new HBox(8, refreshButton, exportButton, configButton);
+        Button editAbfragenBtn = new Button("📝 ABFRAGEN bearbeiten");
+        editAbfragenBtn.setOnAction(e ->
+                AbfragenEditor.show((Stage) tableView.getScene().getWindow(), oracleConn)
+        );
+
+        topBar = new HBox(8, refreshButton, exportButton, configButton, editAbfragenBtn);
         topBar.setPadding(new Insets(8));
 
-        root.getChildren().addAll(topBar, tableView);
+        content.getChildren().addAll(topBar, tableView);
         VBox.setVgrow(tableView, Priority.ALWAYS);
 
-        // initial laden
-        refreshTable();
+        // Busy-Overlay
+        busy = new ProgressIndicator();
+        busy.setMaxSize(90, 90);
+        busyLabel = new Label("Abfragen werden ausgeführt …");
+        busyLabel.setStyle("-fx-text-fill: white; -fx-font-size: 14px;");
+
+        VBox overlayBox = new VBox(12, busy, busyLabel);
+        overlayBox.setAlignment(Pos.CENTER);
+
+        overlay = new StackPane(overlayBox);
+        overlay.setStyle("-fx-background-color: rgba(0,0,0,0.35);");
+        overlay.setVisible(false);
+        overlay.setMouseTransparent(false); // blockiert Interaktionen darunter
+
+        // Root als StackPane: content + overlay
+        StackPane root = new StackPane(content, overlay);
+
+        // initial laden (async)
+        refreshTableAsync();
 
         Scene scene = new Scene(root, 1000, 600);
         primaryStage.setTitle("Datenbank Vergleich");
@@ -90,7 +122,7 @@ public class Main extends Application {
             // Nach eventuellen Änderungen: DB-Mapping & Haupttabelle neu laden
             resolver = new DBConfigResolver(oracleConn);
             dbMap = resolver.resolveConnections();
-            refreshTable();
+            refreshTableAsync();
         } catch (Exception ex) {
             ex.printStackTrace();
             new Alert(Alert.AlertType.ERROR, "Konnte DB-Config nicht öffnen:\n" + ex.getMessage()).showAndWait();
@@ -131,88 +163,152 @@ public class Main extends Application {
         return v.trim();
     }
 
-    private void refreshTable() {
+    // ======================
+    // Async-Refresh mit Overlay
+    // ======================
+
+    private void refreshTableAsync() {
+        setBusy(true, "Abfragen werden ausgeführt …");
+
+        Task<LoadResult> task = new Task<LoadResult>() {
+            @Override
+            protected LoadResult call() throws Exception {
+                // 1) Daten laden (Oracle) – nur im Hintergrundthread
+                List<QueryModel> queries = resolver.loadQueries();
+                Map<String, String> localDbMap = new LinkedHashMap<>(dbMap);
+
+                // Fortschritt kalkulieren
+                int totalSteps = 0;
+                for (QueryModel qm : queries) totalSteps += qm.getDbKuerzel().size();
+                if (totalSteps == 0) totalSteps = 1;
+                int step = 0;
+
+                // 2) Items zusammenbauen (keine UI-Zugriffe!)
+                List<Map<String, String>> items = new ArrayList<>();
+                for (QueryModel qm : queries) {
+                    Map<String, String> row = new LinkedHashMap<>();
+                    row.put("SQL", qm.getSql());
+
+                    for (String db : qm.getDbKuerzel()) {
+                        String value;
+                        if (localDbMap.containsKey(db)) {
+                            String[] parts = localDbMap.get(db).split(";");
+                            String jdbcUrl = parts[0];
+                            String user = parts.length > 1 ? parts[1] : "";
+                            String pass = parts.length > 2 ? parts[2] : "";
+                            try {
+                                value = DBQueryExecutor.execute(jdbcUrl, user, pass, qm.getSql());
+                            } catch (Exception ex) {
+                                value = "Fehler: " + ex.getMessage();
+                            }
+                        } else {
+                            value = "Unbekannt";
+                        }
+                        row.put(db, value);
+
+                        step++;
+                        updateProgress(step, totalSteps);
+                        if ((step & 3) == 0) {
+                            updateMessage("Arbeite … (" + step + "/" + totalSteps + ")");
+                        }
+                    }
+                    items.add(row);
+                }
+                return new LoadResult(items, localDbMap);
+            }
+        };
+
+        // Overlay-Bindings
+        busy.progressProperty().bind(task.progressProperty());
+        busyLabel.textProperty().bind(task.messageProperty());
+
+        task.setOnSucceeded(e -> {
+            busy.progressProperty().unbind();
+            busyLabel.textProperty().unbind();
+            LoadResult res = task.getValue();
+            applyTableData(res.items, res.dbMap);
+            setBusy(false, null);
+        });
+
+        task.setOnFailed(e -> {
+            busy.progressProperty().unbind();
+            busyLabel.textProperty().unbind();
+            setBusy(false, null);
+
+            Throwable ex = task.getException();
+            ex.printStackTrace();
+            new Alert(Alert.AlertType.ERROR,
+                    "Fehler beim Laden:\n" + (ex != null ? ex.getMessage() : "unbekannt")).showAndWait();
+        });
+
+        new Thread(task, "refreshTableAsync").start();
+    }
+
+    private void setBusy(boolean on, String message) {
+        overlay.setVisible(on);
+        if (topBar != null) topBar.setDisable(on);
+        tableView.setDisable(on);
+        if (message != null) busyLabel.setText(message);
+    }
+
+    /** Baut die TableView-Spalten auf und setzt Items (nur im FX-Thread aufrufen). */
+    private void applyTableData(List<Map<String, String>> items, Map<String, String> localDbMap) {
         tableView.getItems().clear();
         tableView.getColumns().clear();
 
-        try {
-            List<QueryModel> queries = resolver.loadQueries();
-
-            for (QueryModel qm : queries) {
-                Map<String, String> row = new LinkedHashMap<>();
-                row.put("SQL", qm.getSql());
-                for (String db : qm.getDbKuerzel()) {
-                    if (dbMap.containsKey(db)) {
-                        String[] parts = dbMap.get(db).split(";");
-                        String jdbcUrl = parts[0];
-                        String user = parts.length > 1 ? parts[1] : "";
-                        String pass = parts.length > 2 ? parts[2] : "";
-
-                        String result = DBQueryExecutor.execute(jdbcUrl, user, pass, qm.getSql());
-                        row.put(db, result);
-                    } else {
-                        row.put(db, "Unbekannt");
-                    }
-                }
-                tableView.getItems().add(row);
+        // SQL-Spalte
+        final TableColumn<Map<String, String>, String> sqlCol = new TableColumn<>("SQL");
+        sqlCol.setCellValueFactory(data ->
+                new javafx.beans.property.SimpleStringProperty(data.getValue().getOrDefault("SQL", "")));
+        sqlCol.setPrefWidth(200);
+        sqlCol.setMaxWidth(Double.MAX_VALUE);
+        sqlCol.setCellFactory(tc -> new TableCell<Map<String, String>, String>() {
+            private final javafx.scene.text.Text text = new javafx.scene.text.Text();
+            {
+                text.wrappingWidthProperty().bind(sqlCol.widthProperty().subtract(16));
+                setGraphic(text);
+                setPrefHeight(Control.USE_COMPUTED_SIZE);
             }
+            @Override
+            protected void updateItem(String item, boolean empty) {
+                super.updateItem(item, empty);
+                text.setText((empty || item == null) ? "" : item);
+            }
+        });
+        tableView.getColumns().add(sqlCol);
 
-            tableView.setFixedCellSize(-1);
-
-            // SQL-Spalte
-            final TableColumn<Map<String, String>, String> sqlCol = new TableColumn<>("SQL");
-            sqlCol.setCellValueFactory(data ->
-                    new javafx.beans.property.SimpleStringProperty(data.getValue().getOrDefault("SQL", "")));
-            sqlCol.setPrefWidth(200);
-            sqlCol.setMaxWidth(Double.MAX_VALUE);
-            sqlCol.setCellFactory(tc -> new TableCell<Map<String, String>, String>() {
-                private final javafx.scene.text.Text text = new javafx.scene.text.Text();
-                {
-                    text.wrappingWidthProperty().bind(sqlCol.widthProperty().subtract(16));
-                    setGraphic(text);
-                    setPrefHeight(Control.USE_COMPUTED_SIZE);
-                }
+        // DB-Spalten in Reihenfolge der Map
+        for (final String db : localDbMap.keySet()) {
+            TableColumn<Map<String, String>, String> col = new TableColumn<>(db);
+            col.setCellValueFactory(data ->
+                    new javafx.beans.property.SimpleStringProperty(data.getValue().getOrDefault(db, "")));
+            col.setPrefWidth(220);
+            col.setCellFactory(column -> new TableCell<Map<String, String>, String>() {
                 @Override
                 protected void updateItem(String item, boolean empty) {
                     super.updateItem(item, empty);
-                    text.setText((empty || item == null) ? "" : item);
-                }
-            });
-            tableView.getColumns().add(sqlCol);
-
-            // DB-Spalten
-            for (final String db : dbMap.keySet()) {
-                TableColumn<Map<String, String>, String> col = new TableColumn<>(db);
-                col.setCellValueFactory(data ->
-                        new javafx.beans.property.SimpleStringProperty(data.getValue().getOrDefault(db, "")));
-                col.setPrefWidth(220);
-                col.setCellFactory(column -> new TableCell<Map<String, String>, String>() {
-                    @Override
-                    protected void updateItem(String item, boolean empty) {
-                        super.updateItem(item, empty);
-                        setText(item);
-                        setStyle("");
-                        if (!empty && item != null) {
-                            Map<String, String> row = getTableView().getItems().get(getIndex());
-                            String referenceValue = null;
-                            for (Map.Entry<String, String> entry : row.entrySet()) {
-                                if (!entry.getKey().equals("SQL")) {
-                                    referenceValue = entry.getValue();
-                                    break;
-                                }
-                            }
-                            if (referenceValue != null && !referenceValue.equals(item)) {
-                                setStyle("-fx-background-color: lightcoral; -fx-text-fill: black;");
+                    setText(item);
+                    setStyle("");
+                    if (!empty && item != null) {
+                        Map<String, String> row = getTableView().getItems().get(getIndex());
+                        String referenceValue = null;
+                        for (Map.Entry<String, String> entry : row.entrySet()) {
+                            if (!entry.getKey().equals("SQL")) {
+                                referenceValue = entry.getValue();
+                                break;
                             }
                         }
+                        if (referenceValue != null && !referenceValue.equals(item)) {
+                            setStyle("-fx-background-color: lightcoral; -fx-text-fill: black;");
+                        }
                     }
-                });
-                tableView.getColumns().add(col);
-            }
-
-        } catch (Exception ex) {
-            ex.printStackTrace();
+                }
+            });
+            tableView.getColumns().add(col);
         }
+
+        tableView.getItems().addAll(items);
+        tableView.setFixedCellSize(-1);
     }
 
     private void exportTableToExcel(TableView<Map<String, String>> tableView) {
@@ -287,5 +383,15 @@ public class Main extends Application {
 
     public static void main(String[] args) {
         launch(args);
+    }
+
+    // --------- kleines DTO für Task-Ergebnis ----------
+    private static class LoadResult {
+        final List<Map<String, String>> items;
+        final Map<String, String> dbMap;
+        LoadResult(List<Map<String, String>> items, Map<String, String> dbMap) {
+            this.items = items;
+            this.dbMap = dbMap;
+        }
     }
 }
