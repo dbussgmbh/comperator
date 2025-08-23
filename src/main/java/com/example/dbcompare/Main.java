@@ -1,7 +1,6 @@
 package com.example.dbcompare;
 
 import javafx.application.Application;
-import javafx.application.Platform;
 import javafx.concurrent.Task;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
@@ -174,47 +173,57 @@ public class Main extends Application {
             @Override
             protected LoadResult call() throws Exception {
                 // 1) Daten laden (Oracle) – nur im Hintergrundthread
-                List<QueryModel> queries = resolver.loadQueries();
+                List<QueryModel> queries = resolver.loadQueries(); // enthält SQL + db-Kürzel-Liste
                 Map<String, String> localDbMap = new LinkedHashMap<>(dbMap);
 
-                // Fortschritt kalkulieren
-                int totalSteps = 0;
-                for (QueryModel qm : queries) totalSteps += qm.getDbKuerzel().size();
-                if (totalSteps == 0) totalSteps = 1;
-                int step = 0;
+                // Welche DBs werden überhaupt gebraucht?
+                Set<String> usedDbs = collectUsedDbs(queries);
 
-                // 2) Items zusammenbauen (keine UI-Zugriffe!)
-                List<Map<String, String>> items = new ArrayList<>();
-                for (QueryModel qm : queries) {
-                    Map<String, String> row = new LinkedHashMap<>();
-                    row.put("SQL", qm.getSql());
+                // 2) EINMAL pro DB verbinden und Connection wiederverwenden
+                Map<String, Connection> connections = new LinkedHashMap<String, Connection>();
+                try {
+                    openConnections(localDbMap, usedDbs, connections);
 
-                    for (String db : qm.getDbKuerzel()) {
-                        String value;
-                        if (localDbMap.containsKey(db)) {
-                            String[] parts = localDbMap.get(db).split(";");
-                            String jdbcUrl = parts[0];
-                            String user = parts.length > 1 ? parts[1] : "";
-                            String pass = parts.length > 2 ? parts[2] : "";
-                            try {
-                                value = DBQueryExecutor.execute(jdbcUrl, user, pass, qm.getSql());
-                            } catch (Exception ex) {
-                                value = "Fehler: " + ex.getMessage();
+                    // Fortschritt kalkulieren (pro DB-Ausführung ein Schritt)
+                    int totalSteps = 0;
+                    for (QueryModel qm : queries) totalSteps += qm.getDbKuerzel().size();
+                    if (totalSteps == 0) totalSteps = 1;
+                    int step = 0;
+
+                    // 3) Items zusammenbauen (keine UI-Zugriffe!)
+                    List<Map<String, String>> items = new ArrayList<Map<String, String>>();
+                    for (QueryModel qm : queries) {
+                        Map<String, String> row = new LinkedHashMap<String, String>();
+                        row.put("SQL", qm.getSql());
+
+
+                        for (String db : qm.getDbKuerzel()) {
+                            String value;
+                            Connection c = connections.get(db);
+                            if (c != null) {
+                                try {
+                                    System.out.println("Ausführen SQL: " + qm.getSql() + " (User: " + c.getSchema() + " at " + c.getMetaData().getURL() + ")");
+                                    value = executeSql(c, qm.getSql());
+                                } catch (Exception ex) {
+                                    value = "Fehler: " + ex.getMessage();
+                                }
+                            } else {
+                                value = "Unbekannt";
                             }
-                        } else {
-                            value = "Unbekannt";
-                        }
-                        row.put(db, value);
+                            row.put(db, value);
 
-                        step++;
-                        updateProgress(step, totalSteps);
-                        if ((step & 3) == 0) {
-                            updateMessage("Arbeite … (" + step + "/" + totalSteps + ")");
+                            step++;
+                            updateProgress(step, totalSteps);
+                            if ((step & 3) == 0) {
+                                updateMessage("Lese DB-Werte … (" + step + "/" + totalSteps + ")");
+                            }
                         }
+                        items.add(row);
                     }
-                    items.add(row);
+                    return new LoadResult(items, localDbMap);
+                } finally {
+                    closeConnections(connections);
                 }
-                return new LoadResult(items, localDbMap);
             }
         };
 
@@ -242,6 +251,72 @@ public class Main extends Application {
         });
 
         new Thread(task, "refreshTableAsync").start();
+    }
+
+    private Set<String> collectUsedDbs(List<QueryModel> queries) {
+        Set<String> used = new LinkedHashSet<String>();
+        for (QueryModel qm : queries) {
+            used.addAll(qm.getDbKuerzel());
+        }
+        return used;
+    }
+
+    /** Öffnet pro verwendeter DB genau EINE Connection und legt sie in 'out' ab. */
+    private void openConnections(Map<String, String> localDbMap,
+                                 Set<String> usedDbs,
+                                 Map<String, Connection> out) {
+        for (String dbKey : usedDbs) {
+            String def = localDbMap.get(dbKey);
+            if (def == null) continue;
+            String[] parts = def.split(";", -1);
+            String jdbcUrl = parts[0];
+            String user = parts.length > 1 ? parts[1] : "";
+            String pass = parts.length > 2 ? parts[2] : "";
+            try {
+                Connection c = DriverManager.getConnection(jdbcUrl, user, pass);
+                try {
+                    c.setReadOnly(true); // optional: ReadOnly für reine Selects
+                } catch (Throwable ignore) {}
+                out.put(dbKey, c);
+            } catch (SQLException ex) {
+                // Wenn Verbindung fehlschlägt, merken wir null => später "Unbekannt/Fehler" anzeigen
+                out.put(dbKey, null);
+            }
+        }
+    }
+
+    private void closeConnections(Map<String, Connection> connections) {
+        for (Map.Entry<String, Connection> e : connections.entrySet()) {
+            Connection c = e.getValue();
+            if (c != null) {
+                try { c.close(); } catch (Exception ignore) {}
+            }
+        }
+    }
+
+    /** Führt das SQL auf der bestehenden Connection aus und liefert ein String-Ergebnis wie bisher. */
+    private String executeSql(Connection conn, String sql) throws SQLException {
+        // Hier kannst du dein bisheriges Format für das Ergebnis übernehmen.
+        // Ich nehme an, DBQueryExecutor.execute(...) liefert einen String (z. B. eine Zahl oder serialisierte Zeilen).
+        // Wir bilden das minimal nach: Wenn das SQL ein SELECT ist, holen wir erste Spalte der ersten Zeile,
+        // sonst die UpdateCount-Info. Passe das bei Bedarf an euer gewünschtes Ausgabeformat an.
+        sql = sql == null ? "" : sql.trim();
+        try (Statement st = conn.createStatement()) {
+            boolean hasRs = st.execute(sql);
+            if (hasRs) {
+                try (ResultSet rs = st.getResultSet()) {
+                    if (rs.next()) {
+                        Object v = rs.getObject(1);
+                        return v == null ? "NULL" : String.valueOf(v);
+                    } else {
+                        return "(keine Zeilen)";
+                    }
+                }
+            } else {
+                int upd = st.getUpdateCount();
+                return "OK (" + upd + ")";
+            }
+        }
     }
 
     private void setBusy(boolean on, String message) {
