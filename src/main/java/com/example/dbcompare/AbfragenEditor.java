@@ -70,13 +70,14 @@ public class AbfragenEditor {
             r.dirty = true;
         });
 
-        // ROWID (read-only)
-        TableColumn<Row, String> ridCol = new TableColumn<>("ROWID");
-        ridCol.setPrefWidth(260);
-        ridCol.setEditable(false);
-        ridCol.setCellValueFactory(c -> c.getValue().rowIdProperty);
+       // ROWID (read-only)
+//        TableColumn<Row, String> ridCol = new TableColumn<>("ROWID");
+//        ridCol.setPrefWidth(260);
+//        ridCol.setEditable(false);
+//        ridCol.setCellValueFactory(c -> c.getValue().rowIdProperty);
 
-        table.getColumns().addAll(idCol, sqlCol, dbCol, ridCol);
+      //  table.getColumns().addAll(idCol, sqlCol, dbCol, ridCol);
+        table.getColumns().addAll(idCol, sqlCol, dbCol);
         table.setItems(data);
 
         // Toolbar
