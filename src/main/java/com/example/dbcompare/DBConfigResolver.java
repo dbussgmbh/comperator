@@ -13,7 +13,7 @@ public class DBConfigResolver {
 
     public List<QueryModel> loadQueries() throws SQLException {
         List<QueryModel> queries = new ArrayList<>();
-        String sql = "SELECT SQL_TEXT, DB_KUERZEL FROM ABFRAGEN";
+        String sql = "SELECT SQL_TEXT, DB_KUERZEL FROM ABFRAGEN WHERE ACTIVE = 1";
         try (Statement stmt = oracleConnection.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
             while (rs.next()) {

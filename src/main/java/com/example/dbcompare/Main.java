@@ -7,6 +7,7 @@ import javafx.geometry.Pos;
 import javafx.scene.Scene;
 import javafx.scene.control.*;
 import javafx.scene.layout.*;
+import javafx.scene.text.Text;
 import javafx.stage.FileChooser;
 import javafx.stage.Stage;
 
@@ -41,7 +42,7 @@ public class Main extends Application {
         String user    = getRequired(props, "oracle.user");
         String pass    = getRequired(props, "oracle.password");
 
-        // 2) Connection
+        // 2) Oracle-Connection
         oracleConn = DriverManager.getConnection(jdbcUrl, user, pass);
 
         resolver = new DBConfigResolver(oracleConn);
@@ -163,7 +164,7 @@ public class Main extends Application {
     }
 
     // ======================
-    // Async-Refresh mit Overlay
+    // Async-Refresh mit Overlay + Connection-Reuse + Spaltenreihenfolge
     // ======================
 
     private void refreshTableAsync() {
@@ -172,12 +173,15 @@ public class Main extends Application {
         Task<LoadResult> task = new Task<LoadResult>() {
             @Override
             protected LoadResult call() throws Exception {
-                // 1) Daten laden (Oracle) – nur im Hintergrundthread
+                // 1) Oracle lesen
                 List<QueryModel> queries = resolver.loadQueries(); // enthält SQL + db-Kürzel-Liste
-                Map<String, String> localDbMap = new LinkedHashMap<>(dbMap);
+                Map<String, String> localDbMap = new LinkedHashMap<String, String>(dbMap);
+
+                // Reihenfolge der DB-Spalten (gemäß erstem Auftreten in DB_KUERZEL)
+                List<String> orderedDbKeys = buildOrderedDbKeys(queries, localDbMap);
 
                 // Welche DBs werden überhaupt gebraucht?
-                Set<String> usedDbs = collectUsedDbs(queries);
+                Set<String> usedDbs = new LinkedHashSet<String>(orderedDbKeys);
 
                 // 2) EINMAL pro DB verbinden und Connection wiederverwenden
                 Map<String, Connection> connections = new LinkedHashMap<String, Connection>();
@@ -196,31 +200,35 @@ public class Main extends Application {
                         Map<String, String> row = new LinkedHashMap<String, String>();
                         row.put("SQL", qm.getSql());
 
-
-                        for (String db : qm.getDbKuerzel()) {
+                        // Ergebnisse in der gewünschten Spaltenreihenfolge befüllen
+                        for (String dbKey : orderedDbKeys) {
                             String value;
-                            Connection c = connections.get(db);
-                            if (c != null) {
-                                try {
-                                    System.out.println("Ausführen SQL: " + qm.getSql() + " (User: " + c.getSchema() + " at " + c.getMetaData().getURL() + ")");
-                                    value = executeSql(c, qm.getSql());
-                                } catch (Exception ex) {
-                                    value = "Fehler: " + ex.getMessage();
+                            if (qm.getDbKuerzel().contains(dbKey)) {
+                                Connection c = connections.get(dbKey);
+                                if (c != null) {
+                                    try {
+                                        System.out.println("Ausführen SQL: " + qm.getSql() + " (User: " + c.getSchema() + " at " + c.getMetaData().getURL() + ")");
+                                        value = executeSql(c, qm.getSql());
+                                    } catch (Exception ex) {
+                                        value = "Fehler: " + ex.getMessage();
+                                    }
+                                } else {
+                                    value = "Unbekannt";
+                                }
+                                step++;
+                                updateProgress(step, totalSteps);
+                                if ((step & 3) == 0) {
+                                    updateMessage("Lese DB-Werte … (" + step + "/" + totalSteps + ")");
                                 }
                             } else {
-                                value = "Unbekannt";
+                                // diese Query ist für diese DB nicht vorgesehen -> leer lassen
+                                value = "";
                             }
-                            row.put(db, value);
-
-                            step++;
-                            updateProgress(step, totalSteps);
-                            if ((step & 3) == 0) {
-                                updateMessage("Lese DB-Werte … (" + step + "/" + totalSteps + ")");
-                            }
+                            row.put(dbKey, value);
                         }
                         items.add(row);
                     }
-                    return new LoadResult(items, localDbMap);
+                    return new LoadResult(items, orderedDbKeys);
                 } finally {
                     closeConnections(connections);
                 }
@@ -235,7 +243,7 @@ public class Main extends Application {
             busy.progressProperty().unbind();
             busyLabel.textProperty().unbind();
             LoadResult res = task.getValue();
-            applyTableData(res.items, res.dbMap);
+            applyTableData(res.items, res.orderedDbKeys);
             setBusy(false, null);
         });
 
@@ -253,12 +261,21 @@ public class Main extends Application {
         new Thread(task, "refreshTableAsync").start();
     }
 
-    private Set<String> collectUsedDbs(List<QueryModel> queries) {
-        Set<String> used = new LinkedHashSet<String>();
+    /** Spalten-Reihenfolge anhand des ersten Auftretens in DB_KUERZEL über alle Queries. */
+    private List<String> buildOrderedDbKeys(List<QueryModel> queries, Map<String, String> localDbMap) {
+        LinkedHashSet<String> order = new LinkedHashSet<String>(); // behält Einfügereihenfolge
         for (QueryModel qm : queries) {
-            used.addAll(qm.getDbKuerzel());
+            for (String k : qm.getDbKuerzel()) {
+                if (localDbMap.containsKey(k)) {
+                    order.add(k);
+                }
+            }
         }
-        return used;
+        // Optional: aus dbMap bekannte, aber nie referenzierte DBs hinten anhängen
+        for (String k : localDbMap.keySet()) {
+            if (!order.contains(k)) order.add(k);
+        }
+        return new ArrayList<String>(order);
     }
 
     /** Öffnet pro verwendeter DB genau EINE Connection und legt sie in 'out' ab. */
@@ -274,13 +291,10 @@ public class Main extends Application {
             String pass = parts.length > 2 ? parts[2] : "";
             try {
                 Connection c = DriverManager.getConnection(jdbcUrl, user, pass);
-                try {
-                    c.setReadOnly(true); // optional: ReadOnly für reine Selects
-                } catch (Throwable ignore) {}
+                try { c.setReadOnly(true); } catch (Throwable ignore) {}
                 out.put(dbKey, c);
             } catch (SQLException ex) {
-                // Wenn Verbindung fehlschlägt, merken wir null => später "Unbekannt/Fehler" anzeigen
-                out.put(dbKey, null);
+                out.put(dbKey, null); // als "nicht verfügbar" markieren
             }
         }
     }
@@ -294,20 +308,16 @@ public class Main extends Application {
         }
     }
 
-    /** Führt das SQL auf der bestehenden Connection aus und liefert ein String-Ergebnis wie bisher. */
+    /** Führt das SQL auf der bestehenden Connection aus und liefert ein String-Ergebnis. */
     private String executeSql(Connection conn, String sql) throws SQLException {
-        // Hier kannst du dein bisheriges Format für das Ergebnis übernehmen.
-        // Ich nehme an, DBQueryExecutor.execute(...) liefert einen String (z. B. eine Zahl oder serialisierte Zeilen).
-        // Wir bilden das minimal nach: Wenn das SQL ein SELECT ist, holen wir erste Spalte der ersten Zeile,
-        // sonst die UpdateCount-Info. Passe das bei Bedarf an euer gewünschtes Ausgabeformat an.
-        sql = sql == null ? "" : sql.trim();
+        sql = (sql == null) ? "" : sql.trim();
         try (Statement st = conn.createStatement()) {
             boolean hasRs = st.execute(sql);
             if (hasRs) {
                 try (ResultSet rs = st.getResultSet()) {
                     if (rs.next()) {
                         Object v = rs.getObject(1);
-                        return v == null ? "NULL" : String.valueOf(v);
+                        return (v == null) ? "NULL" : String.valueOf(v);
                     } else {
                         return "(keine Zeilen)";
                     }
@@ -327,7 +337,7 @@ public class Main extends Application {
     }
 
     /** Baut die TableView-Spalten auf und setzt Items (nur im FX-Thread aufrufen). */
-    private void applyTableData(List<Map<String, String>> items, Map<String, String> localDbMap) {
+    private void applyTableData(List<Map<String, String>> items, List<String> orderedDbKeys) {
         tableView.getItems().clear();
         tableView.getColumns().clear();
 
@@ -338,7 +348,7 @@ public class Main extends Application {
         sqlCol.setPrefWidth(200);
         sqlCol.setMaxWidth(Double.MAX_VALUE);
         sqlCol.setCellFactory(tc -> new TableCell<Map<String, String>, String>() {
-            private final javafx.scene.text.Text text = new javafx.scene.text.Text();
+            private final Text text = new Text();
             {
                 text.wrappingWidthProperty().bind(sqlCol.widthProperty().subtract(16));
                 setGraphic(text);
@@ -352,9 +362,9 @@ public class Main extends Application {
         });
         tableView.getColumns().add(sqlCol);
 
-        // DB-Spalten in Reihenfolge der Map
-        for (final String db : localDbMap.keySet()) {
-            TableColumn<Map<String, String>, String> col = new TableColumn<>(db);
+        // DB-Spalten in gewünschter Reihenfolge
+        for (final String db : orderedDbKeys) {
+            TableColumn<Map<String, String>, String> col = new TableColumn<Map<String, String>, String>(db);
             col.setCellValueFactory(data ->
                     new javafx.beans.property.SimpleStringProperty(data.getValue().getOrDefault(db, "")));
             col.setPrefWidth(220);
@@ -460,13 +470,13 @@ public class Main extends Application {
         launch(args);
     }
 
-    // --------- kleines DTO für Task-Ergebnis ----------
+    // --------- DTO für Task-Ergebnis ----------
     private static class LoadResult {
         final List<Map<String, String>> items;
-        final Map<String, String> dbMap;
-        LoadResult(List<Map<String, String>> items, Map<String, String> dbMap) {
+        final List<String> orderedDbKeys;
+        LoadResult(List<Map<String, String>> items, List<String> orderedDbKeys) {
             this.items = items;
-            this.dbMap = dbMap;
+            this.orderedDbKeys = orderedDbKeys;
         }
     }
 }

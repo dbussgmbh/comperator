@@ -1,11 +1,13 @@
 package com.example.dbcompare;
 
+import javafx.beans.property.SimpleBooleanProperty;
 import javafx.beans.property.SimpleStringProperty;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 import javafx.geometry.Insets;
 import javafx.scene.Scene;
 import javafx.scene.control.*;
+import javafx.scene.control.cell.CheckBoxTableCell;
 import javafx.scene.input.KeyCode;
 import javafx.scene.input.KeyCodeCombination;
 import javafx.scene.input.KeyCombination;
@@ -18,10 +20,11 @@ import java.sql.*;
 import java.util.*;
 
 /**
- * Editor fuer die Oracle-Tabelle ABFRAGEN (Spalten: QUERY_ID, SQL_TEXT, DB_KUERZEL).
+ * Editor fuer die Oracle-Tabelle ABFRAGEN (Spalten: QUERY_ID, SQL_TEXT, DB_KUERZEL, ACTIVE).
  * - Laedt bestehende Zeilen (via ROWID) und merkt sich MAX(QUERY_ID)
  * - Neue Zeilen werden mit MAX(QUERY_ID)+1 vorbelegt
  * - Editieren mit Commit bei Fokusverlust/Enter/Tab (bidirektionale Bindung)
+ * - ACTIVE ist als Checkbox editierbar (true -> 1, false -> 0)
  * - Speichern fuehrt INSERT/UPDATE/DELETE in einer Transaktion aus
  */
 public class AbfragenEditor {
@@ -35,19 +38,19 @@ public class AbfragenEditor {
         stage.setTitle("ABFRAGEN bearbeiten");
         stage.initModality(Modality.WINDOW_MODAL);
 
-        TableView<Row> table = new TableView<>();
+        TableView<Row> table = new TableView<Row>();
         table.setEditable(true);
 
         ObservableList<Row> data = FXCollections.observableArrayList();
 
         // QUERY_ID (read-only im UI)
-        TableColumn<Row, String> idCol = new TableColumn<>("QUERY_ID");
+        TableColumn<Row, String> idCol = new TableColumn<Row, String>("QUERY_ID");
         idCol.setPrefWidth(100);
         idCol.setEditable(false);
         idCol.setCellValueFactory(c -> c.getValue().queryIdProperty);
 
         // SQL_TEXT
-        TableColumn<Row, String> sqlCol = new TableColumn<>("SQL_TEXT");
+        TableColumn<Row, String> sqlCol = new TableColumn<Row, String>("SQL_TEXT");
         sqlCol.setPrefWidth(600);
         sqlCol.setEditable(true);
         sqlCol.setCellValueFactory(c -> c.getValue().sqlTextProperty);
@@ -59,7 +62,7 @@ public class AbfragenEditor {
         });
 
         // DB_KUERZEL
-        TableColumn<Row, String> dbCol = new TableColumn<>("DB_KUERZEL");
+        TableColumn<Row, String> dbCol = new TableColumn<Row, String>("DB_KUERZEL");
         dbCol.setPrefWidth(250);
         dbCol.setEditable(true);
         dbCol.setCellValueFactory(c -> c.getValue().dbKuerzelProperty);
@@ -70,14 +73,22 @@ public class AbfragenEditor {
             r.dirty = true;
         });
 
-       // ROWID (read-only)
-//        TableColumn<Row, String> ridCol = new TableColumn<>("ROWID");
-//        ridCol.setPrefWidth(260);
-//        ridCol.setEditable(false);
-//        ridCol.setCellValueFactory(c -> c.getValue().rowIdProperty);
+        // ACTIVE (Checkbox)
+        TableColumn<Row, Boolean> activeCol = new TableColumn<Row, Boolean>("ACTIVE");
+        activeCol.setPrefWidth(90);
+        activeCol.setEditable(true);
+        activeCol.setCellValueFactory(c -> c.getValue().activeProperty);
+        activeCol.setCellFactory(tc -> new CheckBoxTableCell<Row, Boolean>());
+        // Hinweis: CheckBoxTableCell schreibt direkt ins Property; wir markieren dirty per Listener im Row-Modell.
 
-      //  table.getColumns().addAll(idCol, sqlCol, dbCol, ridCol);
-        table.getColumns().addAll(idCol, sqlCol, dbCol);
+        // ROWID (read-only) – optional
+        // TableColumn<Row, String> ridCol = new TableColumn<Row, String>("ROWID");
+        // ridCol.setPrefWidth(260);
+        // ridCol.setEditable(false);
+        // ridCol.setCellValueFactory(c -> c.getValue().rowIdProperty);
+
+        // Spalten-Reihenfolge festlegen
+        table.getColumns().addAll(idCol, sqlCol, dbCol, activeCol /*, ridCol*/);
         table.setItems(data);
 
         // Toolbar
@@ -85,14 +96,17 @@ public class AbfragenEditor {
         Button delBtn = new Button("Loeschen");
         Button saveBtn = new Button("Speichern");
         Button reloadBtn = new Button("Neu laden");
+        Button closeBtn = new Button("Schliessen");
 
-        HBox toolbar = new HBox(8, addBtn, delBtn, new Separator(), saveBtn, reloadBtn);
+        closeBtn.setOnAction(e -> stage.close());
+
+        HBox toolbar = new HBox(8, addBtn, delBtn, new Separator(), saveBtn, reloadBtn, new Separator(), closeBtn);
         toolbar.setPadding(new Insets(8));
 
         BorderPane root = new BorderPane(table);
         root.setTop(toolbar);
 
-        Set<String> toDeleteRowIds = new HashSet<>();
+        Set<String> toDeleteRowIds = new HashSet<String>();
 
         addBtn.setOnAction(e -> {
             int newId = lastMaxId + 1;
@@ -136,7 +150,7 @@ public class AbfragenEditor {
         });
 
         // Tastaturkuerzel
-        Scene scene = new Scene(root, 1150, 600);
+        Scene scene = new Scene(root, 1200, 600);
         scene.getAccelerators().put(new KeyCodeCombination(KeyCode.S, KeyCombination.SHORTCUT_DOWN), saveBtn::fire);
         scene.setOnKeyPressed(ke -> {
             if (ke.getCode() == KeyCode.DELETE) {
@@ -159,14 +173,16 @@ public class AbfragenEditor {
     private static void loadData(Connection conn, ObservableList<Row> data) throws SQLException {
         data.clear();
         lastMaxId = 0;
-        String sql = "SELECT QUERY_ID, ROWID AS RID, SQL_TEXT, DB_KUERZEL FROM ABFRAGEN ORDER BY QUERY_ID";
+        // ACTIVE mitladen
+        String sql = "SELECT QUERY_ID, ROWID AS RID, SQL_TEXT, DB_KUERZEL, ACTIVE FROM ABFRAGEN ORDER BY QUERY_ID";
         try (Statement st = conn.createStatement(); ResultSet rs = st.executeQuery(sql)) {
             while (rs.next()) {
                 String qid = rs.getString("QUERY_ID");
                 String rid = rs.getString("RID");
                 String sqlText = rs.getString("SQL_TEXT");
                 String db = rs.getString("DB_KUERZEL");
-                data.add(Row.fromDb(qid, rid, sqlText, db));
+                boolean active = rs.getInt("ACTIVE") == 1;
+                data.add(Row.fromDb(qid, rid, sqlText, db, active));
 
                 int idVal = rs.getInt("QUERY_ID");
                 if (!rs.wasNull() && idVal > lastMaxId) lastMaxId = idVal;
@@ -190,12 +206,13 @@ public class AbfragenEditor {
 
             // UPDATEs (nur geaenderte, nicht-neue) - QUERY_ID bleibt unveraendert
             try (PreparedStatement ps = conn.prepareStatement(
-                    "UPDATE ABFRAGEN SET SQL_TEXT = ?, DB_KUERZEL = ? WHERE ROWID = ?")) {
+                    "UPDATE ABFRAGEN SET SQL_TEXT = ?, DB_KUERZEL = ?, ACTIVE = ? WHERE ROWID = ?")) {
                 for (Row r : rows) {
                     if (!r.isNew && r.dirty) {
                         ps.setString(1, nullIfBlank(r.sqlTextProperty.get()));
                         ps.setString(2, nullIfBlank(r.dbKuerzelProperty.get()));
-                        ps.setString(3, r.rowIdProperty.get());
+                        ps.setInt(3, r.activeProperty.get() ? 1 : 0);
+                        ps.setString(4, r.rowIdProperty.get());
                         ps.addBatch();
                     }
                 }
@@ -204,13 +221,14 @@ public class AbfragenEditor {
 
             // INSERTs (neue)
             try (PreparedStatement ps = conn.prepareStatement(
-                    "INSERT INTO ABFRAGEN (QUERY_ID, SQL_TEXT, DB_KUERZEL) VALUES (?, ?, ?)")) {
+                    "INSERT INTO ABFRAGEN (QUERY_ID, SQL_TEXT, DB_KUERZEL, ACTIVE) VALUES (?, ?, ?, ?)")) {
                 for (Row r : rows) {
                     if (r.isNew) {
                         int qid = safeParseInt(r.queryIdProperty.get(), lastMaxId + 1);
                         ps.setInt(1, qid);
                         ps.setString(2, nullIfBlank(r.sqlTextProperty.get()));
                         ps.setString(3, nullIfBlank(r.dbKuerzelProperty.get()));
+                        ps.setInt(4, r.activeProperty.get() ? 1 : 0);
                         ps.addBatch();
                     }
                 }
@@ -240,19 +258,23 @@ public class AbfragenEditor {
 
     // --- Datenmodell ---
     public static class Row {
-        final SimpleStringProperty queryIdProperty = new SimpleStringProperty("");
-        final SimpleStringProperty rowIdProperty   = new SimpleStringProperty("");
-        final SimpleStringProperty sqlTextProperty = new SimpleStringProperty("");
-        final SimpleStringProperty dbKuerzelProperty = new SimpleStringProperty("");
+        final SimpleStringProperty queryIdProperty     = new SimpleStringProperty("");
+        final SimpleStringProperty rowIdProperty       = new SimpleStringProperty("");
+        final SimpleStringProperty sqlTextProperty     = new SimpleStringProperty("");
+        final SimpleStringProperty dbKuerzelProperty   = new SimpleStringProperty("");
+        final SimpleBooleanProperty activeProperty     = new SimpleBooleanProperty(true);
         boolean isNew = false;
         boolean dirty = false;
 
-        static Row fromDb(String queryId, String rowId, String sqlText, String db) {
+        static Row fromDb(String queryId, String rowId, String sqlText, String db, boolean active) {
             Row r = new Row();
             r.queryIdProperty.set(queryId == null ? "" : queryId);
             r.rowIdProperty.set(rowId);
             r.sqlTextProperty.set(sqlText == null ? "" : sqlText);
             r.dbKuerzelProperty.set(db == null ? "" : db);
+            r.activeProperty.set(active);
+            // Listener erst NACH Initialwert setzen -> markiert nur echte User-Änderungen als dirty
+            r.activeProperty.addListener((obs, o, n) -> r.dirty = true);
             r.isNew = false;
             r.dirty = false;
             return r;
@@ -264,6 +286,8 @@ public class AbfragenEditor {
             r.rowIdProperty.set("");
             r.sqlTextProperty.set("");
             r.dbKuerzelProperty.set("");
+            r.activeProperty.set(true); // Default: aktiv
+            r.activeProperty.addListener((obs, o, n) -> r.dirty = true);
             r.isNew = true;
             r.dirty = true;
             return r;
